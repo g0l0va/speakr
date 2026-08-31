@@ -1,0 +1,88 @@
+# Fully isolated local smoke stack for the persistent-speakers diff.
+#
+# NOT the production pilot stack. Separate network, separate ephemeral
+# Postgres (no volume, no data survives `down`), separate container names,
+# separate port (127.0.0.1:8898, the pilot uses SPEAKR_PORT from its own
+# compose/.env). Shares nothing with the running speakr-net /
+# speakr-app / speakr-db. ASR is intentionally not included -- this smoke
+# pass only exercises login, account page load, and DB migrations.
+#
+# Run from the repo root (services/speakr-app/); no secrets required, every
+# credential below is a fixed, throwaway smoke-only value:
+#
+#   docker-compose -f deployment/docker-compose.smoke.yml up -d --build
+#   docker-compose -f deployment/docker-compose.smoke.yml down        # ephemeral db has no volume, nothing to clean up with -v
+#
+# See deployment/README-smoke.md for the smoke-test URL and login.
+
+name: speakr-smoke
+
+networks:
+  speakr-smoke-net:
+    name: speakr-smoke-net
+
+services:
+  smoke-db:
+    image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+    container_name: speakr-smoke-db
+    networks:
+      - speakr-smoke-net
+    # No `volumes:` on purpose -- ephemeral. `down` (no -v needed) leaves
+    # zero data behind; a fresh `up` always starts from an empty database.
+    environment:
+      POSTGRES_USER: smoke
+      POSTGRES_PASSWORD: smoke_only_not_a_real_secret
+      POSTGRES_DB: speakr_smoke
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smoke -d speakr_smoke"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  smoke-app:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.local-overlay
+    image: speakr:persistent-speakers-smoke
+    container_name: speakr-smoke-app
+    depends_on:
+      smoke-db:
+        condition: service_healthy
+    networks:
+      - speakr-smoke-net
+    ports:
+      - "127.0.0.1:8898:8899"
+    environment:
+      SQLALCHEMY_DATABASE_URI: postgresql://smoke:smoke_only_not_a_real_secret@smoke-db:5432/speakr_smoke
+      SECRET_KEY: smoke_only_not_a_real_secret_key
+      ADMIN_USERNAME: smoke_admin
+      ADMIN_EMAIL: smoke-admin@example.com
+      ADMIN_PASSWORD: SmokeTest123!
+      # example.com (RFC 2606) is a real, syntactically-valid domain that
+      # deliberately has no mail-accepting MX record, so it's not a real
+      # mailbox -- but it also isn't a reserved/special-use TLD the way
+      # .local/.internal/.test are (email-validator rejects those outright,
+      # regardless of SKIP_EMAIL_DOMAIN_CHECK below, since that flag only
+      # controls the deliverability/MX check in scripts/docker_create_admin.py,
+      # not the separate structural reserved-name check). Same finding
+      # already documented in docs/baseline.md for the pilot's own
+      # ADMIN_EMAIL. SKIP_EMAIL_DOMAIN_CHECK=true is what actually lets
+      # example.com's missing MX record pass here.
+      SKIP_EMAIL_DOMAIN_CHECK: "true"
+      ALLOW_REGISTRATION: "false"
+      LOG_LEVEL: INFO
+      # No TRANSCRIPTION_*/ASR_*/TEXT_MODEL_* -- ASR and summaries/chat are
+      # intentionally out of scope for this smoke pass (login/account/
+      # migration only). initialize_config() still needs a transcription
+      # connector configured to not hard-exit at import, so a placeholder
+      # (never actually called) is supplied -- same pattern the test suite
+      # itself uses (see conftest.py).
+      TRANSCRIPTION_API_KEY: smoke-placeholder-not-called
+      TRANSCRIPTION_BASE_URL: https://api.openai.com/v1
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8899/', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s

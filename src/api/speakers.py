@@ -52,11 +52,21 @@ def init_speakers_helpers(**kwargs):
 @login_required
 def get_speakers():
     """Get all speakers for the current user, ordered by usage frequency and recency."""
+    from src.services.speaker_embedding_samples import get_sample_counts_by_speaker
+
     try:
         speakers = Speaker.query.filter_by(user_id=current_user.id)\
                                .order_by(Speaker.use_count.desc(), Speaker.last_used.desc())\
                                .all()
-        return jsonify([speaker.to_dict() for speaker in speakers])
+        # One grouped query for every speaker's confirmed/pending/rejected
+        # sample counts, not one query per speaker.
+        sample_counts = get_sample_counts_by_speaker([s.id for s in speakers])
+        result = []
+        for speaker in speakers:
+            data = speaker.to_dict()
+            data['sample_counts'] = sample_counts.get(speaker.id, {'confirmed': 0, 'pending': 0, 'rejected': 0})
+            result.append(data)
+        return jsonify(result)
     except Exception as e:
         current_app.logger.error(f"Error fetching speakers: {e}")
         return jsonify({'error': str(e)}), 500
@@ -406,6 +416,13 @@ def clear_speaker_embeddings(speaker_id):
         speaker.embedding_count = 0
         speaker.confidence_score = None
 
+        # Also delete every voice sample this speaker has (confirmed,
+        # pending, or rejected). Without this, a later manual confirmation
+        # would rebuild average_embedding from the still-present confirmed
+        # samples and silently resurrect exactly the profile "clear" just
+        # removed.
+        SpeakerEmbeddingSample.query.filter_by(speaker_id=speaker.id).delete()
+
         db.session.commit()
 
         current_app.logger.info(f"Cleared voice embeddings for speaker {speaker_id} ({speaker.name})")
@@ -424,6 +441,104 @@ def clear_speaker_embeddings(speaker_id):
         db.session.rollback()
         current_app.logger.error(f"Error clearing speaker embeddings: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@speakers_bp.route('/speakers/<int:speaker_id>/samples', methods=['GET'])
+@login_required
+def get_speaker_samples(speaker_id):
+    """
+    List a speaker's individual voice embedding samples.
+
+    Query param `review_status` (confirmed|pending|rejected) filters the
+    list; omit it to get all samples. Never returns the raw embedding bytes.
+    """
+    from src.services.speaker_embedding_samples import list_samples, SampleNotFoundError
+
+    review_status = request.args.get('review_status')
+    try:
+        samples = list_samples(speaker_id, current_user.id, review_status=review_status)
+        return jsonify([s.to_dict() for s in samples])
+    except SampleNotFoundError:
+        return jsonify({'error': 'Speaker not found'}), 404
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+
+@speakers_bp.route('/speakers/<int:speaker_id>/samples/<int:sample_id>/confirm', methods=['POST'])
+@login_required
+def confirm_speaker_sample(speaker_id, sample_id):
+    """Confirm a pending voice sample; rebuilds the profile from confirmed samples."""
+    from src.services.speaker_embedding_samples import get_sample_for_user, confirm_sample, SampleNotFoundError
+
+    try:
+        # Validate ownership AND that sample_id actually belongs to
+        # speaker_id BEFORE calling the mutating confirm_sample() -- a
+        # mismatch here must be a plain 404 with no side effect, not a
+        # mutation that then gets reported as an error.
+        sample = get_sample_for_user(sample_id, current_user.id)
+        if sample.speaker_id != speaker_id:
+            return jsonify({'error': 'Sample not found'}), 404
+        sample = confirm_sample(sample_id, current_user.id)
+        return jsonify({'success': True, 'sample': sample.to_dict()})
+    except SampleNotFoundError:
+        return jsonify({'error': 'Sample not found'}), 404
+
+
+@speakers_bp.route('/speakers/<int:speaker_id>/samples/<int:sample_id>/reject', methods=['POST'])
+@login_required
+def reject_speaker_sample(speaker_id, sample_id):
+    """Reject a voice sample (pending or confirmed); rebuilds the profile from what remains."""
+    from src.services.speaker_embedding_samples import get_sample_for_user, reject_sample, SampleNotFoundError
+
+    try:
+        # Validate before mutating -- see confirm_speaker_sample().
+        sample = get_sample_for_user(sample_id, current_user.id)
+        if sample.speaker_id != speaker_id:
+            return jsonify({'error': 'Sample not found'}), 404
+        sample = reject_sample(sample_id, current_user.id)
+        return jsonify({'success': True, 'sample': sample.to_dict()})
+    except SampleNotFoundError:
+        return jsonify({'error': 'Sample not found'}), 404
+
+
+@speakers_bp.route('/speakers/<int:speaker_id>/samples/<int:sample_id>', methods=['DELETE'])
+@login_required
+def delete_speaker_sample(speaker_id, sample_id):
+    """Delete a voice sample outright; rebuilds the profile from what remains."""
+    from src.services.speaker_embedding_samples import get_sample_for_user, delete_sample, SampleNotFoundError
+
+    try:
+        sample = get_sample_for_user(sample_id, current_user.id)
+        if sample.speaker_id != speaker_id:
+            return jsonify({'error': 'Sample not found'}), 404
+        delete_sample(sample_id, current_user.id)
+        return jsonify({'success': True})
+    except SampleNotFoundError:
+        return jsonify({'error': 'Sample not found'}), 404
+
+
+@speakers_bp.route('/speakers/<int:speaker_id>/rebuild_profile', methods=['POST'])
+@login_required
+def rebuild_speaker_profile_endpoint(speaker_id):
+    """
+    Explicitly recompute average_embedding/embedding_count/confidence_score
+    from the speaker's currently-confirmed samples.
+
+    No-op (profile left untouched) if the speaker has zero confirmed
+    samples yet.
+    """
+    from src.services.speaker_embedding_samples import rebuild_speaker_profile
+
+    speaker = Speaker.query.filter_by(id=speaker_id, user_id=current_user.id).first()
+    if not speaker:
+        return jsonify({'error': 'Speaker not found'}), 404
+
+    rebuilt = rebuild_speaker_profile(speaker)
+    return jsonify({
+        'success': True,
+        'rebuilt': rebuilt,
+        'speaker': speaker.to_dict(),
+    })
 
 
 @speakers_bp.route('/speakers/snippet-audio/<int:recording_id>', methods=['GET'])

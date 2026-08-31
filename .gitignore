@@ -21,6 +21,7 @@ changes.txt
 !CONTRIBUTING.md
 !.github/CLA-SETUP.md
 !docs/**/*.md
+!deployment/README-smoke.md
 docker-compose.dev.yml
 docker-compose.lite.yml
 docker-compose.postgres.yml

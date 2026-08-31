@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1
+###############################################################################
+# Local production overlay.
+#
+# Rebuilds ONLY the runtime source (src/, templates/, static/) on top of the
+# exact pinned production base image, so everything else already baked into
+# that image -- OS packages, Python deps, ffmpeg, and the downloaded
+# static/vendor/ JS-CSS-font assets -- is reused as-is. Nothing here
+# re-installs or re-downloads anything the base image already has.
+#
+# static/vendor/ is gitignored and does not exist in this checkout (see
+# .gitignore), so `COPY static/ /app/static/` below never has a `vendor/`
+# entry to copy -- Docker COPY merges into an existing destination directory
+# rather than replacing it wholesale, so the base image's vendor assets
+# (placed by the upstream Dockerfile's builder stage) survive untouched.
+# Verified against the upstream Dockerfile itself, which relies on this
+# exact same property (its own final `COPY . .` follows a
+# `COPY --from=builder /app/static/vendor /app/static/vendor` for the same
+# reason), and against the built image directly (file count under
+# /app/static/vendor unchanged from the base).
+###############################################################################
+FROM learnedmachine/speakr:lite@sha256:c4d5047252cbaa82987104e9e3378e205c1d4a6c9080a7f3326b021a4b944ed5
+
+LABEL org.opencontainers.image.title="speakr-persistent-speakers" \
+      org.opencontainers.image.description="Local production overlay: current speakr-app checkout's persistent voice identification changes, layered on the pinned production base image." \
+      org.opencontainers.image.base.name="learnedmachine/speakr:lite@sha256:c4d5047252cbaa82987104e9e3378e205c1d4a6c9080a7f3326b021a4b944ed5" \
+      org.opencontainers.image.version="local-production-overlay" \
+      speakr.local-production-overlay="true" \
+      speakr.local-production-overlay.upstream-revision="b2dc897677035321737eee07906d5ce0a2d8add2"
+
+WORKDIR /app
+
+# Only the three directories this diff touches. Each COPY merges into the
+# existing destination in the base image rather than replacing it (see the
+# vendor-preservation note above) -- nothing outside src/templates/static is
+# copied, so .git/, tests/, .venv*/, and any local secrets in this checkout
+# never enter the image.
+COPY src/ /app/src/
+COPY templates/ /app/templates/
+COPY static/ /app/static/

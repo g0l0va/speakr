@@ -14,7 +14,7 @@ import tempfile
 from sqlalchemy import text, inspect
 
 from src.database import db
-from src.models import Recording, TranscriptChunk, SystemSetting, User
+from src.models import Recording, TranscriptChunk, SystemSetting, User, Speaker, SpeakerEmbeddingSample
 from src.services.embeddings import process_recording_chunks
 from src.utils import add_column_if_not_exists, migrate_column_type, create_index_if_not_exists
 
@@ -249,6 +249,42 @@ def initialize_database(app):
             app.logger.info("Added embedding_count column to speaker table")
         if add_column_if_not_exists(engine, 'speaker', 'confidence_score', 'REAL'):
             app.logger.info("Added confidence_score column to speaker table")
+
+        # Backfill: represent every pre-existing Speaker.average_embedding as
+        # a single confirmed 'import' sample in speaker_embedding_sample (the
+        # table itself is created above by db.create_all(), since it's a new
+        # model, not an added column). This makes legacy profiles rebuildable
+        # from confirmed samples like any other profile, without discarding
+        # or altering the original blended vector. Idempotent: only inserts
+        # for a speaker that doesn't already have a sample row, so it's safe
+        # to run on every boot.
+        try:
+            legacy_speakers = Speaker.query.filter(Speaker.average_embedding.isnot(None)).all()
+            backfilled = 0
+            for speaker in legacy_speakers:
+                already_has_sample = SpeakerEmbeddingSample.query.filter_by(speaker_id=speaker.id).first()
+                if already_has_sample:
+                    continue
+                db.session.add(SpeakerEmbeddingSample(
+                    speaker_id=speaker.id,
+                    user_id=speaker.user_id,
+                    recording_id=None,
+                    source_speaker_label=None,
+                    embedding=speaker.average_embedding,
+                    embedding_dim=len(speaker.average_embedding) // 4,
+                    source='import',
+                    review_status='confirmed',
+                ))
+                backfilled += 1
+            if backfilled:
+                db.session.commit()
+                app.logger.info(
+                    f"Backfilled {backfilled} imported voice-embedding sample(s) "
+                    "from legacy Speaker.average_embedding"
+                )
+        except Exception as e:
+            db.session.rollback()
+            app.logger.warning(f"Speaker embedding sample backfill skipped: {e}")
 
         # Add is_new_upload column to processing_job table for tracking upload vs reprocessing jobs
         if add_column_if_not_exists(engine, 'processing_job', 'is_new_upload', 'BOOLEAN DEFAULT 0'):

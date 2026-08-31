@@ -41,7 +41,7 @@ from src.utils.dates import to_utc_naive
 from src.utils.ffmpeg_utils import FFmpegError, FFmpegNotFoundError
 from src.utils.titles import resolve_upload_title
 from src.services.speaker import update_speaker_usage
-from src.services.speaker_embedding_matcher import update_speaker_embedding
+from src.services.speaker_embedding_samples import record_manual_confirmation
 from src.services.speaker_snippets import create_speaker_snippets
 
 # Incognito mode - disabled by default, enable via environment variable
@@ -1028,8 +1028,14 @@ def update_speakers(recording_id):
                         ).first()
 
                         if speaker:
-                            # Update the speaker's voice embedding
-                            similarity = update_speaker_embedding(speaker, embedding, recording.id)
+                            # Manual assignment: record a confirmed voice
+                            # sample and rebuild the profile from confirmed
+                            # samples (see speaker_embedding_samples.py).
+                            similarity = record_manual_confirmation(
+                                speaker, embedding, recording.id,
+                                user_id=current_user.id,
+                                source_speaker_label=speaker_label,
+                            )
                             embeddings_updated += 1
 
                             if similarity is not None:
@@ -1092,7 +1098,14 @@ def update_speakers(recording_id):
 def update_transcript(recording_id):
     """Updates the complete transcript data including text edits and speaker changes."""
     try:
-        recording = db.session.get(Recording, recording_id)
+        # Row lock: with_for_update() takes a real row lock on PostgreSQL and
+        # is a harmless no-op on SQLite (verified empirically -- neither
+        # dialect needs a conditional guard here). Serializes two overlapping
+        # submissions for the SAME recording (a duplicate network request,
+        # or a request that slipped through before the frontend's
+        # single-flight guard) so the second one always compares against the
+        # first one's already-committed result, never a stale pre-commit read.
+        recording = Recording.query.filter_by(id=recording_id).with_for_update().first()
         if not recording:
             return jsonify({'error': 'Recording not found'}), 404
 
@@ -1107,7 +1120,10 @@ def update_transcript(recording_id):
         if not transcript_data or not isinstance(transcript_data, list):
             return jsonify({'error': 'Invalid transcript data provided'}), 400
 
-        # Update speaker names in the transcript data
+        # Compute the resulting transcript/participants WITHOUT mutating the
+        # recording yet, so this can be compared against the current
+        # committed state (held under the row lock above) to detect a
+        # genuine no-op resubmit -- an identical payload arriving twice.
         speaker_names_used = []
         for segment in transcript_data:
             original_speaker_label = segment.get('speaker')
@@ -1124,10 +1140,8 @@ def update_transcript(recording_id):
                     if new_name not in speaker_names_used:
                         speaker_names_used.append(new_name)
 
-        # Save the updated transcript
-        recording.transcription = json.dumps(transcript_data)
+        new_transcription = json.dumps(transcript_data)
 
-        # Update participants
         final_speakers = set()
         for seg in transcript_data:
             speaker = seg.get('speaker')
@@ -1135,11 +1149,91 @@ def update_transcript(recording_id):
                 # Only include speakers with real names (not default labels)
                 if not re.match(r'^SPEAKER_\d+$', str(speaker), re.IGNORECASE):
                     final_speakers.add(speaker)
-        recording.participants = ', '.join(sorted(list(final_speakers)))
+        new_participants = ', '.join(sorted(list(final_speakers)))
+
+        is_noop_resubmit = (
+            new_transcription == recording.transcription
+            and new_participants == (recording.participants or '')
+        )
+
+        if is_noop_resubmit:
+            # Identical to what's already stored -- a duplicate submission,
+            # not a real edit. Must not re-bump use_count, re-confirm voice
+            # samples, re-create snippets, or re-queue a summary job, but
+            # still responds successfully (the user's data IS saved, just
+            # not by this particular request).
+            current_app.logger.info(
+                f"update_transcript: no-op resubmit for recording {recording_id} "
+                "(transcript/participants unchanged) -- skipping usage/samples/snippets/summary"
+            )
+            db.session.commit()  # releases the row lock; nothing to persist
+            recording_dict = recording.to_dict(viewer_user=current_user)
+            enrich_recording_dict_with_user_status(recording_dict, recording, current_user)
+            return jsonify({
+                'success': True,
+                'message': 'Transcript already up to date.',
+                'recording': recording_dict,
+                'summary_queued': False
+            })
+
+        # Save the updated transcript
+        recording.transcription = new_transcription
+        recording.participants = new_participants
 
         # Update speaker usage statistics
         if speaker_names_used:
             update_speaker_usage(speaker_names_used)
+
+        # Manually confirm speaker voice embeddings and create snippets, same
+        # as update_speakers() -- this previously only ran on the no-edits
+        # path, so a combined segment-reassignment + naming save (like
+        # relabeling one segment SPEAKER_04 -> SPEAKER_02 and then naming
+        # SPEAKER_00..03) silently skipped voice-profile confirmation
+        # entirely because it always went through this endpoint instead.
+        if recording.speaker_embeddings and speaker_map:
+            try:
+                embeddings_data = json.loads(recording.speaker_embeddings) if isinstance(recording.speaker_embeddings, str) else recording.speaker_embeddings
+
+                speaker_label_to_name = {}
+                for speaker_label, speaker_info in speaker_map.items():
+                    name = speaker_info.get('name', '').strip()
+                    if speaker_info.get('isMe') and not name:
+                        name = current_user.name or 'Me'
+                    if name and not re.match(r'^SPEAKER_\d+$', name, re.IGNORECASE):
+                        speaker_label_to_name[speaker_label] = name
+
+                for speaker_label, embedding in embeddings_data.items():
+                    if speaker_label in speaker_label_to_name and embedding and len(embedding) == 256:
+                        speaker_name = speaker_label_to_name[speaker_label]
+                        speaker = Speaker.query.filter_by(
+                            user_id=current_user.id,
+                            name=speaker_name
+                        ).first()
+
+                        if speaker:
+                            similarity = record_manual_confirmation(
+                                speaker, embedding, recording.id,
+                                user_id=current_user.id,
+                                source_speaker_label=speaker_label,
+                            )
+                            if similarity is not None:
+                                current_app.logger.info(
+                                    f"Updated voice profile for '{speaker_name}' "
+                                    f"(similarity: {similarity*100:.1f}%)"
+                                )
+                            else:
+                                current_app.logger.info(
+                                    f"Created initial voice profile for '{speaker_name}'"
+                                )
+
+                if speaker_label_to_name:
+                    snippets_created = create_speaker_snippets(recording.id, speaker_map)
+                    if snippets_created > 0:
+                        current_app.logger.info(f"Created {snippets_created} speaker snippets")
+
+            except Exception as e:
+                current_app.logger.error(f"Error updating speaker embeddings: {e}", exc_info=True)
+                # Don't fail the whole request if embedding update fails
 
         db.session.commit()
 

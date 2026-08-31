@@ -710,6 +710,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             // persisted on the recording when reprocess is submitted.
             const reprocessPromptVariables = reactive({});
             const isAutoIdentifying = ref(false);
+            // Single-flight guard for the "Save Names" action (saveSpeakerNames /
+            // saveTranscriptEdits) -- prevents a double-click or slow network
+            // response from firing a second concurrent save request while one
+            // is already in flight. Set/cleared only at the guarded entry
+            // point; see composables/speakers.js for why the two functions'
+            // own mutual fallback calls must NOT re-check this flag.
+            const isSavingSpeakerNames = ref(false);
             const asrReprocessOptions = reactive({
                 language: '',
                 min_speakers: null,
@@ -1736,7 +1743,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 generatedShareLink, existingShareDetected, recordingPublicShares, isLoadingPublicShares,
                 userShares, isLoadingShares, copiedShareId,
                 shareToDelete, showShareDeleteModal, recordingToDelete, recordingToReset,
-                reprocessType, reprocessRecording, reprocessPromptVariables, isAutoIdentifying, asrReprocessOptions,
+                reprocessType, reprocessRecording, reprocessPromptVariables, isAutoIdentifying, isSavingSpeakerNames, asrReprocessOptions,
                 summaryReprocessPromptSource, summaryReprocessSelectedTagId, summaryReprocessCustomPrompt, summaryReprocessPromptMode,
                 speakerMap, speakerColorMap, modalSpeakers, speakerDisplayMap, regenerateSummaryAfterSpeakerUpdate, speakerSuggestions,
                 loadingSuggestions, activeSpeakerInput, voiceSuggestions, loadingVoiceSuggestions,

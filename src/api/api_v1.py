@@ -2137,7 +2137,7 @@ def assign_speakers(recording_id):
     }
     """
     from src.services.speaker import update_speaker_usage
-    from src.services.speaker_embedding_matcher import update_speaker_embedding
+    from src.services.speaker_embedding_samples import record_manual_confirmation
     from src.services.speaker_snippets import create_speaker_snippets
     from src.services.job_queue import job_queue
 
@@ -2254,7 +2254,14 @@ def assign_speakers(recording_id):
                             name=speaker_name
                         ).first()
                         if speaker_obj:
-                            update_speaker_embedding(speaker_obj, embedding, recording.id)
+                            # Manual assignment: record a confirmed voice
+                            # sample and rebuild the profile from confirmed
+                            # samples (see speaker_embedding_samples.py).
+                            record_manual_confirmation(
+                                speaker_obj, embedding, recording.id,
+                                user_id=current_user.id,
+                                source_speaker_label=speaker_label,
+                            )
                             embeddings_updated += 1
 
                 if speaker_label_to_name:

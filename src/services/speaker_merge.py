@@ -5,21 +5,31 @@ This service handles merging multiple speaker profiles into one.
 Useful when users accidentally create duplicate speakers for the same person.
 
 When speakers are merged:
-- Voice embeddings are combined using weighted average
-- All snippets are transferred to the target speaker
-- Usage statistics are combined
-- Source speakers are deleted
-- Confidence score is recalculated
+- Individual SpeakerEmbeddingSample rows are re-parented from every source
+  onto the target (never cascade-deleted -- see _transfer_embedding_samples).
+- The target's average_embedding/embedding_count/confidence_score are then
+  rebuilt from ITS confirmed samples alone (now including every confirmed
+  sample re-parented from the sources). Only when that rebuild finds zero
+  confirmed samples anywhere in the merge (a legacy/pre-backfill profile
+  with a raw average_embedding but no sample rows) does the old
+  weighted-average blend of the raw blobs run as a fallback, so no legacy
+  data is silently dropped.
+- All snippets are transferred to the target speaker.
+- Usage statistics are combined.
+- Source speakers are deleted.
 """
+
+from datetime import datetime
 
 import numpy as np
 from src.database import db
-from src.models import Speaker, SpeakerSnippet
+from src.models import Speaker, SpeakerSnippet, SpeakerEmbeddingSample
 from src.services.speaker_embedding_matcher import (
     serialize_embedding,
     deserialize_embedding,
     calculate_confidence
 )
+from src.services.speaker_embedding_samples import rebuild_speaker_profile
 
 
 def merge_speakers(target_id, source_ids, user_id):
@@ -61,8 +71,22 @@ def merge_speakers(target_id, source_ids, user_id):
     if target_id in source_ids:
         raise ValueError("Cannot merge a speaker with itself")
 
-    # Combine embeddings
-    _combine_embeddings(target, sources)
+    # Re-parent every individual voice sample from the sources onto the
+    # target BEFORE anything else touches embeddings or deletes a source --
+    # this must run first so no sample is ever cascade-deleted (see
+    # _transfer_embedding_samples' own docstring for why) and so the
+    # confirmed-sample rebuild right after sees the fully merged set.
+    _transfer_embedding_samples(target, sources)
+
+    # Prefer a clean, deterministic rebuild from confirmed samples (now
+    # including every confirmed sample re-parented from the sources above).
+    # Only fall back to the legacy weighted-average blend of raw
+    # average_embedding blobs when NEITHER the target nor any source has a
+    # single confirmed sample anywhere -- a legacy/pre-backfill edge case
+    # where average_embedding carries data no sample row represents yet.
+    rebuilt_from_samples = rebuild_speaker_profile(target, commit=False)
+    if not rebuilt_from_samples:
+        _combine_embeddings(target, sources)
 
     # Transfer snippets
     for source in sources:
@@ -92,10 +116,16 @@ def merge_speakers(target_id, source_ids, user_id):
                 # If sorting fails, just concatenate and truncate
                 target.embeddings_history = (target_history + source_history)[-10:]
 
-    # Recalculate confidence score
-    target.confidence_score = calculate_confidence(target)
+    # rebuild_speaker_profile() already set confidence_score correctly (from
+    # confirmed samples) when it ran. Only recompute via the legacy
+    # history-based calculation when the legacy blend path was used instead.
+    if not rebuilt_from_samples:
+        target.confidence_score = calculate_confidence(target)
 
-    # Delete source speakers
+    # Delete source speakers. Safe: _transfer_embedding_samples() already
+    # flushed every sample re-parent/status change to the DB above, so each
+    # source has zero remaining speaker_embedding_sample rows by the time
+    # this cascade is evaluated.
     for source in sources:
         db.session.delete(source)
 
@@ -103,6 +133,67 @@ def merge_speakers(target_id, source_ids, user_id):
     db.session.commit()
 
     return target
+
+
+def _transfer_embedding_samples(target, sources):
+    """
+    Re-parent every SpeakerEmbeddingSample row from *sources* onto *target*.
+
+    Confirmed and rejected samples can never collide (the partial unique
+    index only covers review_status='pending'), so they're re-parented in a
+    single bulk UPDATE -- the same proven pattern already used below for
+    SpeakerSnippet, which sidesteps SQLAlchemy's delete-orphan cascade
+    entirely by writing the FK directly rather than mutating loaded ORM
+    objects' relationship collections.
+
+    Pending samples are handled one at a time: a source and the target (or
+    two sources in the same merge) can each hold an independent pending
+    guess for the exact same (recording_id, source_speaker_label), which
+    would violate the partial unique index once both land on target.id.
+    Resolved deterministically -- the newer sample (by created_at, then id
+    as a tiebreak) stays 'pending'; the other is marked 'rejected' (
+    superseded by the merge, not silently deleted, so the audit trail
+    survives) before being re-parented too. Session autoflush means each
+    iteration's query sees every earlier iteration's re-parent/rejection in
+    this same call, so this also resolves chains across more than two
+    colliding samples (e.g. two sources both duplicating the target).
+
+    Finally flushes explicitly so every change above is written to the DB
+    before the caller deletes any source speaker -- otherwise SQLAlchemy's
+    delete-orphan cascade (declared on Speaker.embedding_samples) could
+    still find a sample via a stale in-memory collection and delete it
+    despite the FK having "already" been reassigned in Python.
+    """
+    source_ids = [s.id for s in sources]
+
+    db.session.query(SpeakerEmbeddingSample).filter(
+        SpeakerEmbeddingSample.speaker_id.in_(source_ids),
+        SpeakerEmbeddingSample.review_status != 'pending',
+    ).update({SpeakerEmbeddingSample.speaker_id: target.id}, synchronize_session=False)
+
+    pending_from_sources = SpeakerEmbeddingSample.query.filter(
+        SpeakerEmbeddingSample.speaker_id.in_(source_ids),
+        SpeakerEmbeddingSample.review_status == 'pending',
+    ).all()
+
+    for sample in pending_from_sources:
+        existing = SpeakerEmbeddingSample.query.filter_by(
+            speaker_id=target.id,
+            recording_id=sample.recording_id,
+            source_speaker_label=sample.source_speaker_label,
+            review_status='pending',
+        ).first()
+
+        if existing is not None:
+            incoming_key = (sample.created_at, sample.id)
+            existing_key = (existing.created_at, existing.id)
+            loser = existing if incoming_key > existing_key else sample
+            loser.review_status = 'rejected'
+            loser.reviewed_at = datetime.utcnow()
+
+        sample.speaker_id = target.id
+
+    db.session.flush()
 
 
 def _combine_embeddings(target, sources):

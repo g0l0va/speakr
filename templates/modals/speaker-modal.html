@@ -414,9 +414,11 @@
             <div class="flex gap-2">
                 <button @click="closeSpeakerModal" class="btn btn--ghost" v-text="t('common.cancel')"></button>
                 <button @click="saveSpeakerNames"
-                        :disabled="!hasSpeakerNames"
-                        class="btn btn--primary"
-                        v-text="t('buttons.saveNames')"></button>
+                        :disabled="!hasSpeakerNames || isSavingSpeakerNames"
+                        class="btn btn--primary">
+                    <span v-if="!isSavingSpeakerNames" v-text="t('buttons.saveNames')"></span>
+                    <span v-else><i class="fas fa-spinner fa-spin"></i></span>
+                </button>
             </div>
         </div>
     </div>

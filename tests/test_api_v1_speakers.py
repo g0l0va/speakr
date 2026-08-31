@@ -431,7 +431,8 @@ def test_assign_regenerate_summary():
 
 
 def test_assign_embeddings_updated():
-    """With speaker_embeddings -> update_speaker_embedding called, counts returned."""
+    """With speaker_embeddings -> a confirmed voice sample is recorded and
+    the profile is rebuilt (record_manual_confirmation), counts returned."""
     with app.app_context():
         user, cu = _get_or_create_test_user()
         token_rec, token = _create_api_token(user)
@@ -443,9 +444,9 @@ def test_assign_embeddings_updated():
         speaker = _create_test_speaker(user, "Alice")
         client = app.test_client()
         try:
-            mock_update = MagicMock()
+            mock_confirm = MagicMock(return_value=None)
             mock_snippets = MagicMock(return_value=2)
-            with patch("src.services.speaker_embedding_matcher.update_speaker_embedding", mock_update), \
+            with patch("src.services.speaker_embedding_samples.record_manual_confirmation", mock_confirm), \
                  patch("src.services.speaker_snippets.create_speaker_snippets", mock_snippets):
                 resp = client.put(f"/api/v1/recordings/{rec.id}/speakers/assign",
                                   headers={"X-API-Token": token},
@@ -453,7 +454,7 @@ def test_assign_embeddings_updated():
             assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
             body = resp.get_json()
             assert body.get("embeddings_updated") >= 1, f"embeddings_updated: {body}"
-            mock_update.assert_called()
+            mock_confirm.assert_called()
         finally:
             _cleanup(rec, speaker, token_rec)
             if cu:

@@ -2233,8 +2233,8 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                         from src.services.speaker_embedding_matcher import (
                             apply_auto_speaker_labels,
                             apply_speaker_names_to_transcription,
-                            update_speaker_profiles_from_recording
                         )
+                        from src.services.speaker_embedding_samples import create_pending_samples_from_recording
                         current_app.logger.info(f"Applying embedding auto speaker labelling for recording {recording.id}")
                         speaker_map = apply_auto_speaker_labels(recording, label_user)
 
@@ -2242,9 +2242,21 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                             current_app.logger.info(f"Auto-matched speakers: {speaker_map}")
                             if apply_speaker_names_to_transcription(recording, speaker_map):
                                 current_app.logger.info(f"Applied speaker names to transcription")
-                                updated_count = update_speaker_profiles_from_recording(recording, speaker_map, label_user)
-                                if updated_count > 0:
-                                    current_app.logger.info(f"Updated {updated_count} speaker profiles with new embeddings")
+                                # Automatic match: queue a pending sample per
+                                # matched speaker for later human review.
+                                # Deliberately does NOT touch the speaker's
+                                # profile (average_embedding/confidence/use
+                                # count) -- an unreviewed guess must not be
+                                # able to retrain itself into more guesses.
+                                sample_model_name = getattr(connector, 'model', None) or connector_name
+                                pending_count = create_pending_samples_from_recording(
+                                    recording, speaker_map, label_user, model_name=sample_model_name
+                                )
+                                if pending_count > 0:
+                                    current_app.logger.info(
+                                        f"Queued {pending_count} voice sample(s) for review "
+                                        "(auto-match; profile unchanged until confirmed)"
+                                    )
                             else:
                                 current_app.logger.warning(f"Failed to apply speaker names to transcription for recording {recording.id}")
                         else:

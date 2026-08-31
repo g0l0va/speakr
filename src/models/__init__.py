@@ -17,6 +17,11 @@ from src.database import db
 from .user import User, Speaker
 from .api_token import APIToken
 from .speaker_snippet import SpeakerSnippet
+from .speaker_embedding_sample import (
+    SpeakerEmbeddingSample,
+    SAMPLE_SOURCES,
+    SAMPLE_REVIEW_STATUSES,
+)
 from .recording import Recording, TranscriptChunk
 from .sharing import Share, InternalShare, SharedRecordingState
 from .organization import Group, GroupMembership, Tag, RecordingTag, Folder
@@ -50,6 +55,9 @@ __all__ = [
     'Speaker',
     'APIToken',
     'SpeakerSnippet',
+    'SpeakerEmbeddingSample',
+    'SAMPLE_SOURCES',
+    'SAMPLE_REVIEW_STATUSES',
     # Recording models
     'Recording',
     'TranscriptChunk',

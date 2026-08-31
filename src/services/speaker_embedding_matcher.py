@@ -73,6 +73,16 @@ def find_matching_speakers(target_embedding, user_id, threshold=0.70):
     """
     Find speakers matching a target voice embedding for a specific user.
 
+    Prefers a speaker's CONFIRMED voice samples when any exist (multi-prototype
+    match: similarity is the best match against any one confirmed sample,
+    which tolerates a speaker sounding different across recordings better
+    than a single blended average would). Falls back to the legacy
+    Speaker.average_embedding for speakers with no confirmed samples yet
+    (pre-migration profiles, or a speaker with no reviewed samples at all).
+    Always scoped to user_id -- a speaker query filtered by user_id, and a
+    confirmed-samples lookup that only ever reads rows already tied to that
+    same speaker, so results never cross user boundaries.
+
     Args:
         target_embedding: The voice embedding to match against (256-dim array/list)
         user_id: User ID to search within
@@ -82,6 +92,10 @@ def find_matching_speakers(target_embedding, user_id, threshold=0.70):
         list: Sorted list of matching speakers with scores
               [{'speaker_id': 5, 'name': 'John', 'similarity': 85.3, 'confidence': 0.92}, ...]
     """
+    # Local import: speaker_embedding_samples imports from this module, so a
+    # top-level import here would be circular.
+    from src.services.speaker_embedding_samples import get_confirmed_sample_embeddings
+
     # Get all speakers with embeddings for this user
     speakers = Speaker.query.filter_by(user_id=user_id).filter(
         Speaker.average_embedding.isnot(None)
@@ -93,9 +107,17 @@ def find_matching_speakers(target_embedding, user_id, threshold=0.70):
     matches = []
     for speaker in speakers:
         try:
-            # Deserialize and compare
-            speaker_emb = deserialize_embedding(speaker.average_embedding)
-            similarity = calculate_similarity(target_embedding, speaker_emb)
+            confirmed_embeddings = get_confirmed_sample_embeddings(speaker.id)
+            if confirmed_embeddings:
+                similarity = max(
+                    calculate_similarity(target_embedding, sample_emb)
+                    for sample_emb in confirmed_embeddings
+                )
+            else:
+                # Fallback: no confirmed samples for this speaker yet, use
+                # the legacy blended average.
+                speaker_emb = deserialize_embedding(speaker.average_embedding)
+                similarity = calculate_similarity(target_embedding, speaker_emb)
 
             if similarity >= threshold:
                 matches.append({

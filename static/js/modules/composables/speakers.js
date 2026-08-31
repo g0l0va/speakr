@@ -3,6 +3,8 @@
  * Handles speaker identification, naming, and navigation
  */
 
+import { guardSingleFlight } from '../utils/single-flight.js';
+
 export function useSpeakers(state, utils, processedTranscription) {
     const { nextTick } = Vue;
     const {
@@ -14,7 +16,7 @@ export function useSpeakers(state, utils, processedTranscription) {
         editSpeakerDropdownPositions, newSpeakerName, newSpeakerIsMe,
         newSpeakerSuggestions, loadingNewSpeakerSuggestions, showNewSpeakerSuggestions,
         editingSegmentIndex, editingSpeakerIndex, editedText, editedTranscriptData, highlightedSpeaker,
-        isAutoIdentifying, availableSpeakers, editingSegments,
+        isAutoIdentifying, isSavingSpeakerNames, availableSpeakers, editingSegments,
         currentSpeakerGroupIndex, speakerGroups, currentUserName,
         voiceSuggestions, loadingVoiceSuggestions
     } = state;
@@ -255,9 +257,18 @@ export function useSpeakers(state, utils, processedTranscription) {
         }
     };
 
-    const saveTranscriptEdits = async () => {
+    // saveTranscriptEditsInner / saveSpeakerNamesInner are the UNGUARDED
+    // implementations and call each other directly (transcript edits with no
+    // staged data falls back to a plain name save; a name save with staged
+    // transcript edits delegates to the combined save). The single-flight
+    // isSavingSpeakerNames guard below wraps ONLY the two public,
+    // externally-invoked entry points (saveTranscriptEdits / saveSpeakerNames)
+    // -- if the guard lived inside these Inner functions instead, the second
+    // one's own check would see the flag the first already set and bail out
+    // silently, breaking the exact fallback/delegation this pair relies on.
+    const saveTranscriptEditsInner = async () => {
         if (!selectedRecording.value || !editedTranscriptData.value) {
-            return saveSpeakerNames(); // Fall back to regular speaker name save
+            return saveSpeakerNamesInner(); // Fall back to regular speaker name save
         }
 
         try {
@@ -325,12 +336,12 @@ export function useSpeakers(state, utils, processedTranscription) {
         }
     };
 
-    const saveSpeakerNames = async () => {
+    const saveSpeakerNamesInner = async () => {
         if (!selectedRecording.value) return;
 
         // If there are transcript edits, save those instead
         if (editedTranscriptData.value) {
-            return saveTranscriptEdits();
+            return saveTranscriptEditsInner();
         }
 
         // Create a filtered speaker map that excludes entries with blank names
@@ -390,6 +401,18 @@ export function useSpeakers(state, utils, processedTranscription) {
             setGlobalError(`Failed to save speaker names: ${error.message}`);
         }
     };
+
+    // Guarded public entry points -- single-flight on isSavingSpeakerNames,
+    // shared by both names since they're two routes into the same logical
+    // "Save Names" action. Whichever one fires first sets the flag and
+    // releases it once the underlying (unguarded) Inner implementation
+    // settles; a second click, or a second call routed through either name,
+    // while one is still in flight is a no-op, so the backend never sees an
+    // overlapping duplicate save request. See guardSingleFlight's own
+    // docstring for why the guard wraps these Inner implementations rather
+    // than living inside them.
+    const saveTranscriptEdits = guardSingleFlight(isSavingSpeakerNames, saveTranscriptEditsInner);
+    const saveSpeakerNames = guardSingleFlight(isSavingSpeakerNames, saveSpeakerNamesInner);
 
     // Poll for summary completion after regeneration
     const pollForSummaryCompletion = async (recordingId) => {

@@ -150,6 +150,242 @@ class TestDatabaseMigrations(unittest.TestCase):
                 setting = SystemSetting.query.filter_by(key=key).first()
                 self.assertIsNotNone(setting, f"Missing system setting: {key}")
 
+    def test_speaker_embedding_sample_table_exists(self):
+        """Verify the new per-sample table and its columns were created."""
+        with self.app.app_context():
+            tables = self._get_table_names()
+            self.assertIn('speaker_embedding_sample', tables)
+            columns = self._get_column_names('speaker_embedding_sample')
+            expected = [
+                'id', 'speaker_id', 'user_id', 'recording_id',
+                'source_speaker_label', 'embedding', 'embedding_dim',
+                'source', 'review_status', 'similarity_to_profile',
+                'quality_metadata', 'model_name', 'model_version',
+                'created_at', 'reviewed_at',
+            ]
+            for col in expected:
+                self.assertIn(col, columns, f"Missing speaker_embedding_sample column: {col}")
+
+    def test_speaker_embedding_sample_backfill_is_idempotent(self):
+        """A pre-existing Speaker.average_embedding is backfilled as exactly
+        one confirmed 'import' sample, and re-running initialize_database()
+        (as every app boot does) must not create a second one."""
+        with self.app.app_context():
+            from src.models import User, Speaker, SpeakerEmbeddingSample
+            import numpy as np
+
+            user = User(username='pg_mig_test_user', email='pgmig@local.test')
+            db.session.add(user)
+            db.session.commit()
+
+            speaker = Speaker(
+                name='Legacy Speaker',
+                user_id=user.id,
+                average_embedding=np.zeros(256, dtype=np.float32).tobytes(),
+                embedding_count=1,
+            )
+            db.session.add(speaker)
+            db.session.commit()
+
+            try:
+                # First run after the speaker existed: should backfill exactly one sample.
+                initialize_database(self.app)
+                samples = SpeakerEmbeddingSample.query.filter_by(speaker_id=speaker.id).all()
+                self.assertEqual(len(samples), 1)
+                self.assertEqual(samples[0].source, 'import')
+                self.assertEqual(samples[0].review_status, 'confirmed')
+
+                # Re-running (every boot does this) must not duplicate it.
+                initialize_database(self.app)
+                initialize_database(self.app)
+                samples_again = SpeakerEmbeddingSample.query.filter_by(speaker_id=speaker.id).all()
+                self.assertEqual(len(samples_again), 1, "Backfill must be idempotent across repeated boots")
+            finally:
+                SpeakerEmbeddingSample.query.filter_by(speaker_id=speaker.id).delete()
+                db.session.delete(speaker)
+                db.session.delete(user)
+                db.session.commit()
+
+    def test_speaker_embedding_sample_check_constraints_enforced(self):
+        """source/review_status CHECK constraints must be enforced by the
+        real database engine, not just validated in Python."""
+        with self.app.app_context():
+            from sqlalchemy.exc import IntegrityError
+            from src.models import User, Speaker, SpeakerEmbeddingSample
+            import numpy as np
+
+            user = User(username='pg_check_test_user', email='pgcheck@local.test')
+            db.session.add(user)
+            db.session.commit()
+            speaker = Speaker(name='Check Test Speaker', user_id=user.id)
+            db.session.add(speaker)
+            db.session.commit()
+
+            try:
+                bad_source = SpeakerEmbeddingSample(
+                    speaker_id=speaker.id, user_id=user.id,
+                    embedding=np.zeros(256, dtype=np.float32).tobytes(),
+                    source='bogus', review_status='pending',
+                )
+                db.session.add(bad_source)
+                with self.assertRaises(IntegrityError):
+                    db.session.commit()
+                db.session.rollback()
+
+                bad_status = SpeakerEmbeddingSample(
+                    speaker_id=speaker.id, user_id=user.id,
+                    embedding=np.zeros(256, dtype=np.float32).tobytes(),
+                    source='manual', review_status='bogus',
+                )
+                db.session.add(bad_status)
+                with self.assertRaises(IntegrityError):
+                    db.session.commit()
+                db.session.rollback()
+
+                # embedding_dim must be exactly 256 -- the whole pipeline
+                # (calculate_similarity, np.stack in rebuild_speaker_profile)
+                # assumes it, and nothing upstream of the DB enforces it.
+                bad_dim = SpeakerEmbeddingSample(
+                    speaker_id=speaker.id, user_id=user.id,
+                    embedding=np.zeros(128, dtype=np.float32).tobytes(),
+                    embedding_dim=128,
+                    source='manual', review_status='confirmed',
+                )
+                db.session.add(bad_dim)
+                with self.assertRaises(IntegrityError):
+                    db.session.commit()
+                db.session.rollback()
+            finally:
+                SpeakerEmbeddingSample.query.filter_by(speaker_id=speaker.id).delete()
+                db.session.delete(speaker)
+                db.session.delete(user)
+                db.session.commit()
+
+    def test_speaker_embedding_sample_pending_dedup_unique_index_enforced(self):
+        """The partial unique index (speaker_id, recording_id,
+        source_speaker_label) WHERE review_status='pending' must actually
+        be created and enforced on Postgres -- this is where the
+        dialect-specific postgresql_where syntax could silently fail to
+        apply if it were wrong."""
+        with self.app.app_context():
+            from sqlalchemy.exc import IntegrityError
+            from src.models import User, Speaker, SpeakerEmbeddingSample, Recording
+            import numpy as np
+
+            user = User(username='pg_dedup_test_user', email='pgdedup@local.test')
+            db.session.add(user)
+            db.session.commit()
+            speaker = Speaker(name='Dedup Test Speaker', user_id=user.id)
+            db.session.add(speaker)
+            db.session.commit()
+            # A real recording_id, not NULL: two NULLs are NOT considered
+            # equal for uniqueness purposes in Postgres, so a test using
+            # recording_id=None on both rows would not actually exercise the
+            # collision this index exists to catch (and doesn't reflect
+            # real usage -- create_pending_samples_from_recording() always
+            # has a concrete recording.id).
+            recording = Recording(user_id=user.id, title='Dedup Test Recording', status='COMPLETED')
+            db.session.add(recording)
+            db.session.commit()
+
+            try:
+                first = SpeakerEmbeddingSample(
+                    speaker_id=speaker.id, user_id=user.id, recording_id=recording.id,
+                    source_speaker_label='SPEAKER_00',
+                    embedding=np.zeros(256, dtype=np.float32).tobytes(),
+                    source='automatic', review_status='pending',
+                )
+                db.session.add(first)
+                db.session.commit()
+
+                duplicate = SpeakerEmbeddingSample(
+                    speaker_id=speaker.id, user_id=user.id, recording_id=recording.id,
+                    source_speaker_label='SPEAKER_00',
+                    embedding=np.ones(256, dtype=np.float32).tobytes(),
+                    source='automatic', review_status='pending',
+                )
+                db.session.add(duplicate)
+                with self.assertRaises(IntegrityError):
+                    db.session.commit()
+                db.session.rollback()
+
+                # Confirmed rows with the same (speaker, recording, label)
+                # are NOT deduped -- the index only targets 'pending'.
+                confirmed_dup = SpeakerEmbeddingSample(
+                    speaker_id=speaker.id, user_id=user.id, recording_id=recording.id,
+                    source_speaker_label='SPEAKER_00',
+                    embedding=np.ones(256, dtype=np.float32).tobytes(),
+                    source='manual', review_status='confirmed',
+                )
+                db.session.add(confirmed_dup)
+                db.session.commit()  # must NOT raise
+            finally:
+                SpeakerEmbeddingSample.query.filter_by(speaker_id=speaker.id).delete()
+                db.session.delete(speaker)
+                db.session.delete(recording)
+                db.session.delete(user)
+                db.session.commit()
+
+    def test_speaker_merge_transfers_and_dedups_pending_against_real_postgres(self):
+        """merge_speakers() re-parents samples and resolves a duplicate
+        pending sample via the same partial unique index verified above --
+        exercised against a real Postgres connection, not just SQLite,
+        since that index's WHERE clause is dialect-specific syntax."""
+        with self.app.app_context():
+            from datetime import datetime
+            from src.models import User, Speaker, SpeakerEmbeddingSample, Recording
+            from src.services.speaker_embedding_samples import create_sample
+            from src.services.speaker_merge import merge_speakers
+            import numpy as np
+
+            user = User(username='pg_merge_test_user', email='pgmerge@local.test')
+            db.session.add(user)
+            db.session.commit()
+            target = Speaker(name='PG Merge Target', user_id=user.id)
+            source = Speaker(name='PG Merge Source', user_id=user.id)
+            db.session.add_all([target, source])
+            db.session.commit()
+            recording = Recording(user_id=user.id, title='PG Merge Recording', status='COMPLETED')
+            db.session.add(recording)
+            db.session.commit()
+
+            target_pending = create_sample(
+                target, np.zeros(256, dtype=np.float32).tolist(), user_id=user.id,
+                recording_id=recording.id, source_speaker_label='SPEAKER_00',
+                source='automatic', review_status='pending',
+            )
+            target_pending.created_at = datetime(2026, 1, 1)
+            source_pending = create_sample(
+                source, np.ones(256, dtype=np.float32).tolist(), user_id=user.id,
+                recording_id=recording.id, source_speaker_label='SPEAKER_00',
+                source='automatic', review_status='pending',
+            )
+            source_pending.created_at = datetime(2026, 1, 2)  # newer -- must win
+            db.session.commit()
+
+            try:
+                merge_speakers(target.id, [source.id], user.id)  # must not raise IntegrityError
+
+                self.assertIsNone(db.session.get(Speaker, source.id))
+
+                db.session.refresh(target_pending)
+                db.session.refresh(source_pending)
+                self.assertEqual(target_pending.review_status, 'rejected')
+                self.assertEqual(source_pending.review_status, 'pending')
+                self.assertEqual(source_pending.speaker_id, target.id)
+
+                still_pending = SpeakerEmbeddingSample.query.filter_by(
+                    speaker_id=target.id, recording_id=recording.id,
+                    source_speaker_label='SPEAKER_00', review_status='pending',
+                ).all()
+                self.assertEqual(len(still_pending), 1)
+            finally:
+                SpeakerEmbeddingSample.query.filter_by(speaker_id=target.id).delete()
+                db.session.delete(target)
+                db.session.delete(recording)
+                db.session.delete(user)
+                db.session.commit()
+
     def test_engine_type_matches_expectation(self):
         """Sanity check: confirm we're testing against the expected engine."""
         with self.app.app_context():
