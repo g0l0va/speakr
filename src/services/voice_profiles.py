@@ -46,7 +46,6 @@ OUTLIER_MIN_SAMPLES = 3
 # A variant backed by a single sample of a person who has others counts a
 # little less than an established one.
 SINGLETON_PENALTY = 0.03
-AUTO_SAMPLE_WEIGHT = 0.5
 LEGACY_MAX_WEIGHT = 5.0
 
 DEFAULT_SUGGESTION_THRESHOLD = 0.60
@@ -324,8 +323,8 @@ def _materialize_legacy(speaker):
     db.session.flush()
 
 
-def record_sample(speaker, recording, label, vector, speech_seconds=None, source='confirmed'):
-    """Assign one (recording, label) voice to a person.
+def record_sample(speaker, recording, label, vector, speech_seconds=None):
+    """Assign one manually confirmed (recording, label) voice to a person.
 
     Replaces whatever sample that (recording, label) had, so re-saving or
     correcting a name never double-counts. Returns 'stored', 'rejected'
@@ -355,7 +354,6 @@ def record_sample(speaker, recording, label, vector, speech_seconds=None, source
                 db.session.delete(existing)
             return 'rejected'
 
-    weight = AUTO_SAMPLE_WEIGHT if source == 'auto' else 1.0
     if existing is None:
         existing = SpeakerVoiceSample(user_id=speaker.user_id, recording_id=recording.id, label=label)
         db.session.add(existing)
@@ -364,8 +362,8 @@ def record_sample(speaker, recording, label, vector, speech_seconds=None, source
     existing.dimension = int(vec.shape[0])
     existing.space_id = space
     existing.speech_seconds = speech_seconds
-    existing.source = source
-    existing.weight = weight
+    existing.source = 'confirmed'
+    existing.weight = 1.0
     existing.updated_at = datetime.utcnow()
     db.session.flush()
     _trim(speaker, space)
@@ -660,8 +658,9 @@ def _labels_for(key, embeddings, label_map):
 def record_label_names(recording, key_to_name):
     """Update only the recording's label map with the names given in a save.
 
-    Used when training fails, so the map still follows the transcript and a
-    later correction can reach the embedding. Does not commit.
+    Used after automatic labelling or when training fails. The map follows
+    the transcript so a later manual save can reach the embedding.
+    Does not commit.
     """
     embeddings = load_embeddings(recording)
     label_map = dict(recording.speaker_label_map or {})
@@ -671,7 +670,7 @@ def record_label_names(recording, key_to_name):
     recording.speaker_label_map = label_map or None
 
 
-def apply_names_to_profiles(recording, key_to_name, seconds_by_key, user, source='confirmed', shown_as=None):
+def apply_names_to_profiles(recording, key_to_name, seconds_by_key, user, shown_as=None):
     """Train voice profiles from the names given in one save.
 
     key_to_name maps the speaker values the transcript showed before the save
@@ -720,7 +719,7 @@ def apply_names_to_profiles(recording, key_to_name, seconds_by_key, user, source
             old = SpeakerVoiceSample.query.filter_by(user_id=user.id, recording_id=recording.id, label=label).first()
             if old is not None and old.speaker_id != speaker.id:
                 touched.add(old.speaker_id)
-            result = record_sample(speaker, recording, label, embeddings[label], seconds, source)
+            result = record_sample(speaker, recording, label, embeddings[label], seconds)
             if result in stats:
                 stats[result] += 1
             touched.add(speaker.id)

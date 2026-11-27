@@ -240,22 +240,26 @@ def test_correcting_a_name_moves_the_sample(ctx):
     assert db.session.get(Recording, rec.id).speaker_label_map == {"SPEAKER_00": "Bea"}
 
 
-def test_confirming_an_auto_label_upgrades_its_sample(ctx):
+@pytest.mark.parametrize("confirmed_name", ["Ana", "Bea", "SPEAKER_00"])
+def test_saving_an_auto_label_trains_only_the_manually_named_speaker(ctx, confirmed_name):
     user = _user(auto_speaker_labelling=True)
     ana = person()
     _save_names(user, _recording(user, {"SPEAKER_00": ana}), {"SPEAKER_00": "Ana"})
     rec = _recording(user, {"SPEAKER_00": near(ana, 0.05)})
     from src.services.speaker_embedding_matcher import (
-        apply_auto_speaker_labels, apply_speaker_names_to_transcription, update_speaker_profiles_from_recording)
+        apply_auto_speaker_labels, apply_speaker_names_to_transcription)
     mapping = apply_auto_speaker_labels(rec, user)
     assert mapping == {"SPEAKER_00": "Ana"}
-    apply_speaker_names_to_transcription(rec, mapping)
-    update_speaker_profiles_from_recording(rec, mapping, user)
+    assert apply_speaker_names_to_transcription(rec, mapping)
+    assert SpeakerVoiceSample.query.filter_by(recording_id=rec.id).count() == 0
+    _save_names(user, db.session.get(Recording, rec.id), {"Ana": confirmed_name})
+    if confirmed_name == "SPEAKER_00":
+        assert SpeakerVoiceSample.query.filter_by(recording_id=rec.id).count() == 0
+        return
     sample = SpeakerVoiceSample.query.filter_by(recording_id=rec.id).one()
-    assert (sample.source, sample.weight) == ("auto", vp.AUTO_SAMPLE_WEIGHT)
-    _save_names(user, db.session.get(Recording, rec.id), {"Ana": "Ana"})
-    sample = SpeakerVoiceSample.query.filter_by(recording_id=rec.id).one()
-    assert (sample.source, sample.weight) == ("confirmed", 1.0)
+    speaker = db.session.get(Speaker, sample.speaker_id)
+    assert speaker.name == confirmed_name
+    assert (sample.label, sample.source, sample.weight) == ("SPEAKER_00", "confirmed", 1.0)
 
 
 def test_resaving_does_not_double_count(ctx):
