@@ -277,32 +277,20 @@ def apply_speaker_names_to_transcription(recording, speaker_map):
     from src.services.speaker import participants_from_segments
     recording.participants = participants_from_segments(segments)
 
-    # Save updated transcription
+    # Keep the link to the original embedding for a later manual confirmation.
+    from src.services.voice_profiles import record_label_names
+    record_label_names(recording, speaker_map)
     recording.transcription = json.dumps(segments, ensure_ascii=False)
     db.session.commit()
 
     return True
 
 
-def update_speaker_profiles_from_recording(recording, speaker_map, user):
-    """
-    Train voice profiles from auto-applied labels.
-
-    Samples from auto-labelling carry half the weight of names a person
-    confirmed, and confirming or correcting the name later in the speaker
-    dialog replaces them.
-
-    Returns:
-        int: Number of speaker profiles updated
-    """
-    if not speaker_map or not recording.speaker_embeddings:
-        return 0
-    from src.services.voice_profiles import apply_names_to_profiles
-    stats = apply_names_to_profiles(recording, dict(speaker_map), None, user, source='auto')
+def record_auto_speaker_usage(speaker_map, user):
+    """Track recent speaker usage after applying embedding-based labels."""
     for name in set(speaker_map.values()):
         speaker = Speaker.query.filter_by(user_id=user.id, name=name).first()
         if speaker:
             speaker.use_count = (speaker.use_count or 0) + 1
             speaker.last_used = datetime.utcnow()
     db.session.commit()
-    return stats['stored']

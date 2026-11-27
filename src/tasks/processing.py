@@ -2589,7 +2589,7 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                         from src.services.speaker_embedding_matcher import (
                             apply_auto_speaker_labels,
                             apply_speaker_names_to_transcription,
-                            update_speaker_profiles_from_recording
+                            record_auto_speaker_usage
                         )
                         current_app.logger.info(f"Applying embedding auto speaker labelling for recording {recording.id}")
                         speaker_map = apply_auto_speaker_labels(recording, label_user)
@@ -2600,9 +2600,7 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                             current_app.logger.debug(f"Auto-matched speakers: {speaker_map}")
                             if apply_speaker_names_to_transcription(recording, speaker_map):
                                 current_app.logger.info(f"Applied speaker names to transcription")
-                                updated_count = update_speaker_profiles_from_recording(recording, speaker_map, label_user)
-                                if updated_count > 0:
-                                    current_app.logger.info(f"Updated {updated_count} speaker profiles with new embeddings")
+                                record_auto_speaker_usage(speaker_map, label_user)
                             else:
                                 current_app.logger.warning(f"Failed to apply speaker names to transcription for recording {recording.id}")
                         else:

@@ -23,8 +23,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.app import app, db
-from src.models import Recording, User
+from src.models import Recording, Speaker, SpeakerVoiceSample, User
 import src.tasks.processing as proc
+from src.services import voice_profiles
 from src.services.transcription.base import (
     ConnectorSpecifications, TranscriptionResponse, TranscriptionSegment,
 )
@@ -400,6 +401,29 @@ def test_upload_stores_normalized_labels_and_embedding_keys(recording):
         speakers, embeddings = _stored(recording.id)
         assert speakers == ['SPEAKER_00', 'SPEAKER_01', 'SPEAKER_00']
         assert embeddings == {'SPEAKER_00': [0.1, 0.2], 'SPEAKER_01': [0.3, 0.4]}
+
+
+def test_transcription_auto_label_does_not_train_voice_profile(recording):
+    with app.app_context():
+        rec = db.session.get(Recording, recording.id)
+        user = db.session.get(User, rec.user_id)
+        user.auto_speaker_labelling = True
+        voice = voice_profiles.normalize([1.0, 0.0])
+        previous_profile = voice_profiles.to_bytes(voice)
+        speaker = Speaker(user_id=user.id, name='Dana', average_embedding=previous_profile, embedding_count=1)
+        db.session.add(speaker)
+        db.session.commit()
+
+        response = _response(['A'], speaker_embeddings={'A': [1.0, 0.1]})
+        response.segments[0].end_time = 30.0
+        _ingest(recording, _FakeConnector(response))
+
+        speakers, _ = _stored(recording.id)
+        assert speakers == ['Dana']
+        assert rec.speaker_label_map == {'SPEAKER_00': 'Dana'}
+        assert SpeakerVoiceSample.query.filter_by(speaker_id=speaker.id).count() == 0
+        assert speaker.embedding_count == 1
+        assert speaker.average_embedding == previous_profile
 
 
 def test_reprocessing_stores_normalized_labels(recording):
